@@ -14,7 +14,7 @@ import gymnasium as gym
 from minigrid.wrappers import FlatObsWrapper
 from stable_baselines3.common.monitor import Monitor
 
-from oracle.wrapper import OracleCreditWrapper
+from wrapper import OracleCreditWrapper
 
 ENV_ID = "MiniGrid-MemoryS7-v0"
 

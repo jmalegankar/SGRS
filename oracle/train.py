@@ -64,9 +64,9 @@ try:
 except ImportError:
     sys.exit("sb3-contrib not found. Run:  pip install sb3-contrib")
 
-from oracle.envs import _verify_env_id, make_env_fn, make_eval_env_fn
-from oracle.inspect import inspect_env
-from oracle.plot import LABELS, plot_results
+from envs import _verify_env_id, make_env_fn, make_eval_env_fn
+from inspect_env import inspect_env
+from plot import LABELS, plot_results
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Experiment configuration
@@ -198,8 +198,8 @@ def run_single(
     t0 = time.time()
     model.learn(
         total_timesteps = total_steps,
-        callback        = [eval_callback, ProgressCallback(log_every=50_000)],
-        progress_bar    = False,
+        callback        = [eval_callback, ProgressCallback(log_every=10_000)],
+        progress_bar    = True,
     )
     elapsed = time.time() - t0
 

@@ -26,8 +26,8 @@ from PIL import Image
 from minigrid.core.world_object import Ball, Box, Goal, Key, Wall
 from minigrid.wrappers import FlatObsWrapper
 
-from oracle.envs import ENV_ID
-from oracle.wrapper import OracleCreditWrapper
+from envs import ENV_ID
+from wrapper import OracleCreditWrapper
 
 
 # ── ASCII grid printer ────────────────────────────────────────────────────────
