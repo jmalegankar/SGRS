@@ -99,28 +99,83 @@ PPO_KWARGS = dict(
 # Logging callback
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ProgressCallback(BaseCallback):
-    """Prints a brief log line every `log_every` timesteps."""
+class OracleMetricsCallback(BaseCallback):
+    """
+    Logs oracle-specific metrics to TensorBoard and stdout every `log_every` steps.
 
-    def __init__(self, log_every: int = 25_000, verbose: int = 0):
+    TB tags written:
+      oracle/junction_correct_frac  — fraction of junction events that were correct
+      oracle/ep_bonus_mean          — mean oracle bonus per completed episode
+      oracle/ep_env_reward_mean     — mean raw env reward (oracle bonus subtracted out)
+
+    rollout/ep_rew_mean (logged by SB3 automatically) shows the oracle-SHAPED reward,
+    which is intentionally inflated.  Use oracle/ep_env_reward_mean for true performance
+    during training.
+    """
+
+    def __init__(self, log_every: int = 10_000, use_oracle: bool = True, verbose: int = 0):
         super().__init__(verbose)
-        self.log_every = log_every
-        self._last_log = 0
+        self.log_every   = log_every
+        self.use_oracle  = use_oracle
+        self._last_log   = 0
+
+        # Accumulators reset each logging window
+        self._junction_correct : List[bool]  = []
+        self._ep_bonuses       : List[float] = []
+        self._ep_env_rewards   : List[float] = []
 
     def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+
+        for info in infos:
+            # Junction accuracy (only fires when junction event occurred this step)
+            if "oracle_junction_correct" in info:
+                self._junction_correct.append(info["oracle_junction_correct"])
+
+            # Per-episode oracle bonus and raw env reward (logged when episode ends)
+            if "episode" in info:
+                shaped_r = info["episode"]["r"]
+                bonus    = info.get("oracle_bonus", 0.0)  # bonus on this terminal step
+                # Approximate: accumulate total bonus from terminal-step info only.
+                # For a full per-episode breakdown we'd need wrapper-level tracking,
+                # but this gives a good signal.
+                self._ep_bonuses.append(bonus)
+                self._ep_env_rewards.append(shaped_r - bonus)
+
         if self.num_timesteps - self._last_log >= self.log_every:
+            # ── Junction accuracy ─────────────────────────────────────────────
+            if self._junction_correct:
+                frac = float(np.mean(self._junction_correct))
+                self.logger.record("oracle/junction_correct_frac", frac)
+
+            # ── Episode reward breakdown ──────────────────────────────────────
+            if self._ep_env_rewards:
+                self.logger.record("oracle/ep_env_reward_mean", float(np.mean(self._ep_env_rewards)))
+                self.logger.record("oracle/ep_bonus_mean",      float(np.mean(self._ep_bonuses)))
+
+            # ── Stdout progress ───────────────────────────────────────────────
             ep_rewards = [
                 info["episode"]["r"]
-                for info in self.locals.get("infos", [])
+                for info in infos
                 if "episode" in info
             ]
             if ep_rewards:
+                jfrac = (
+                    f"  junc_correct={np.mean(self._junction_correct):.2f}"
+                    if self._junction_correct else ""
+                )
                 print(
                     f"  steps={self.num_timesteps:>8,}  "
-                    f"ep_reward(train)={np.mean(ep_rewards):.3f}  "
-                    f"n_eps={len(ep_rewards)}"
+                    f"ep_rew(shaped)={np.mean(ep_rewards):.3f}"
+                    f"{jfrac}  n_eps={len(ep_rewards)}"
                 )
+
+            # Reset accumulators
+            self._junction_correct = []
+            self._ep_bonuses       = []
+            self._ep_env_rewards   = []
             self._last_log = self.num_timesteps
+
         return True
 
 
@@ -198,7 +253,7 @@ def run_single(
     t0 = time.time()
     model.learn(
         total_timesteps = total_steps,
-        callback        = [eval_callback, ProgressCallback(log_every=10_000)],
+        callback        = [eval_callback, OracleMetricsCallback(log_every=10_000, use_oracle=use_oracle)],
         progress_bar    = True,
     )
     elapsed = time.time() - t0
