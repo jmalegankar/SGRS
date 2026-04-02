@@ -4,8 +4,8 @@ Environment factories for Milestone 0.
 Provides:
   ENV_ID          — canonical MiniGrid Memory env name
   _verify_env_id  — sanity-check registration at startup
-  make_env_fn     — factory for train envs (optionally oracle-wrapped)
-  make_eval_env_fn— factory for plain eval envs (never oracle-shaped)
+  make_env_fn     — factory for train envs (optionally oracle/privileged-wrapped)
+  make_eval_env_fn— factory for eval envs (never oracle-shaped; privileged matches train)
 """
 
 import sys
@@ -15,6 +15,7 @@ from minigrid.wrappers import FlatObsWrapper
 from stable_baselines3.common.monitor import Monitor
 
 from wrapper import OracleCreditWrapper
+from privileged import PrivilegedSignalWrapper
 
 ENV_ID = "MiniGrid-MemoryS7-v0"
 
@@ -37,29 +38,42 @@ def _verify_env_id() -> None:
             sys.exit(1)
 
 
-def make_env_fn(use_oracle: bool, alpha: float, shaping_c: float, seed: int = 0):
+def make_env_fn(
+    use_oracle: bool,
+    alpha: float,
+    shaping_c: float,
+    use_privileged: bool = False,
+    seed: int = 0,
+):
     """
-    Returns a callable that creates a single (optionally oracle-wrapped) env.
-    Suitable for use with make_vec_env / DummyVecEnv.
+    Returns a callable that creates a single training env.
+    Stacking order: OracleCreditWrapper → PrivilegedSignalWrapper/FlatObsWrapper → Monitor.
+    PrivilegedSignalWrapper outputs a flat Box, so FlatObsWrapper is skipped when used.
     """
     def _fn():
         env = gym.make(ENV_ID)
         if use_oracle:
             env = OracleCreditWrapper(env, alpha=alpha, shaping_c=shaping_c)
-        env = FlatObsWrapper(env)
+        if use_privileged:
+            env = PrivilegedSignalWrapper(env)
+        else:
+            env = FlatObsWrapper(env)
         env = Monitor(env)
         return env
     return _fn
 
 
-def make_eval_env_fn(seed: int = 0):
+def make_eval_env_fn(use_privileged: bool = False, seed: int = 0):
     """
-    Returns a callable for the plain evaluation env (never oracle-shaped).
-    Eval always runs on the plain env so we measure true policy quality.
+    Returns a callable for the eval env (never oracle-shaped).
+    use_privileged must match the training condition so obs spaces align.
     """
     def _fn():
         env = gym.make(ENV_ID)
-        env = FlatObsWrapper(env)
+        if use_privileged:
+            env = PrivilegedSignalWrapper(env)
+        else:
+            env = FlatObsWrapper(env)
         env = Monitor(env)
         return env
     return _fn

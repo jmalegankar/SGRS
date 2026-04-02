@@ -1,5 +1,5 @@
 """
-Oracle reward shaping wrapper for MiniGrid Memory environments.
+Oracle reward shaping wrapper for MiniGrid Memory environments — v2.
 
 KEY INSIGHT (from env source inspection):
   All objects in MemoryS7 are GREEN. The distinguishing feature is object TYPE
@@ -7,11 +7,21 @@ KEY INSIGHT (from env source inspection):
   use as ground-truth for the junction detection rather than inferring from
   color or type scanning.
 
-Two dense bonuses are injected:
-  1. Signal step  (t=0): agent's first action — the moment the policy must encode
-                         what it saw. F = +shaping_c always.
-  2. Junction step: first time agent enters a junction arm (y != corridor_y,
-                    x >= junction_x). F = +shaping_c if correct arm, else -shaping_c.
+Junction bonus is ASYMMETRIC: +shaping_c for correct arm, 0 for wrong arm.
+The previous -shaping_c on wrong arm caused value function collapse at alpha=5
+because shaped returns swung from +6 to -5 (explained_variance ≈ 0 throughout).
+
+Shaped return landscape (default alpha=2, shaping_c=1):
+  Correct arm:   0 + 2*1 + 1 = +3.0   ← clear winner
+  Wrong arm:     0 + 2*0 + 0 =  0.0   ← same as timeout (no punishment)
+  Timeout:       0 + 0   + 0 =  0.0
+
+Value function tracks returns in [0, 3] instead of [-5, +6].
+explained_variance should lift above 0.3 within 50k steps.
+
+No step-0 signal bonus (removed in v1, kept removed).
+
+`penalty_wrong=True` re-enables the symmetric -shaping_c penalty for ablation.
 
 Total shaped reward: r̃_t = r_t_env + alpha * F_t
 """
@@ -34,15 +44,17 @@ class OracleCreditWrapper(gym.Wrapper):
     def __init__(
         self,
         env: gym.Env,
-        alpha: float = 1.0,
+        alpha: float = 2.0,
         shaping_c: float = 1.0,
         junction_x_frac: float = 0.60,   # junction zone: x >= int(W * frac)
+        penalty_wrong: bool = False,      # if True, wrong arm gets -shaping_c (ablation only)
         verbose: bool = False,
     ):
         super().__init__(env)
         self.alpha           = alpha
         self.shaping_c       = shaping_c
         self.junction_x_frac = junction_x_frac
+        self.penalty_wrong   = penalty_wrong
         self.verbose         = verbose
 
         # Set in reset():
@@ -91,7 +103,6 @@ class OracleCreditWrapper(gym.Wrapper):
 
         # Find signal type (object nearest to agent in the start room, x <= 2)
         self._signal_type = None
-        agent_x = int(inner.agent_pos[0])
         for x in range(min(3, W)):
             for y in range(H):
                 cell = grid.get(x, y)
@@ -102,7 +113,7 @@ class OracleCreditWrapper(gym.Wrapper):
         if self.verbose:
             status = "OK" if ok else "WARNING: success_pos not found"
             print(
-                f"[Oracle] reset scan {status} | "
+                f"[Oracle] reset {status} | "
                 f"signal={self._signal_type} | "
                 f"success_pos={self._success_pos} | "
                 f"failure_pos={self._failure_pos} | "
@@ -120,10 +131,10 @@ class OracleCreditWrapper(gym.Wrapper):
     # ── gym interface ─────────────────────────────────────────────────────────
 
     def reset(self, **kwargs):
-        obs, info        = self.env.reset(**kwargs)
-        self._step       = 0
+        obs, info           = self.env.reset(**kwargs)
+        self._step          = 0
         self._junction_done = False
-        self.events      = []
+        self.events         = []
         self._scan_grid()
         return obs, info
 
@@ -133,24 +144,38 @@ class OracleCreditWrapper(gym.Wrapper):
         agent_pos = (int(inner.agent_pos[0]), int(inner.agent_pos[1]))
         bonus     = 0.0
 
-        # ── Event 1: Signal Observation ── fires on first action (step 0)
+        # ── Event 1: Signal (t=0) — logged only, NO bonus ─────────────────────
+        # Unconditional bonus here created a "safe-wander" local optimum where
+        # timing out returned +1 shaped reward (safer than risking the junction).
         if self._step == 0:
-            bonus += self.shaping_c
-            self.events.append({"step": self._step, "event": "signal", "bonus": self.shaping_c})
+            self.events.append({
+                "step" : self._step,
+                "event": "signal",
+                "type" : self._signal_type,
+                "bonus": 0.0,
+            })
             if self.verbose:
-                print(f"[Oracle] t={self._step:4d}  SIGNAL({self._signal_type})  F={self.shaping_c:+.2f}")
+                print(f"[Oracle] t={self._step:4d}  SIGNAL({self._signal_type})  F=0 (no bonus)")
 
-        # ── Event 2: T-Junction Commitment ──
-        # First time agent enters a non-corridor row inside the junction zone.
+        # ── Event 2: T-Junction Commitment ────────────────────────────────────
+        # Asymmetric: correct arm → +shaping_c, wrong arm → 0 (no penalty).
+        # Keeps value function range bounded: returns in [0, alpha+1] not [-5, +6].
         if (
             not self._junction_done
             and self._junction_x is not None
             and agent_pos[0] >= self._junction_x
             and agent_pos[1] != self._corridor_y
         ):
-            correct    = self._is_correct_direction(agent_pos[1])
-            junc_bonus = self.shaping_c if correct else -self.shaping_c
-            bonus     += junc_bonus
+            correct = self._is_correct_direction(agent_pos[1])
+
+            if correct:
+                junc_bonus = self.shaping_c
+            elif self.penalty_wrong:
+                junc_bonus = -self.shaping_c   # ablation only
+            else:
+                junc_bonus = 0.0               # default: no punishment
+
+            bonus += junc_bonus
             self._junction_done = True
             self.events.append({
                 "step"   : self._step,
@@ -162,9 +187,9 @@ class OracleCreditWrapper(gym.Wrapper):
             info["oracle_junction_correct"] = correct
             info["oracle_junction_step"]    = self._step
             if self.verbose:
-                arm = "SUCCESS" if correct else "FAILURE"
+                arm = "CORRECT" if correct else "WRONG  "
                 print(
-                    f"[Oracle] t={self._step:4d}  JUNCTION→{arm:7s}  "
+                    f"[Oracle] t={self._step:4d}  JUNCTION {arm}  "
                     f"agent_y={agent_pos[1]}  "
                     f"correct_arm_y={self._correct_arm_y}  "
                     f"F={junc_bonus:+.2f}"

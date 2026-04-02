@@ -73,11 +73,13 @@ from plot import LABELS, plot_results
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONDITION_CFG = {
-    # mode           use_lstm  use_oracle
-    "ppo"          : (False,   False),
-    "rppo"         : (True,    False),
-    "ppo_oracle"   : (False,   True),
-    "rppo_oracle"  : (True,    True),
+    # mode                      use_lstm  use_oracle  use_privileged
+    "ppo"                     : (False,   False,      False),
+    "rppo"                    : (True,    False,      False),
+    "ppo_oracle"              : (False,   True,       False),
+    "rppo_oracle"             : (True,    True,       False),
+    "ppo_privileged_oracle"   : (False,   True,       True),
+    "ppo_privileged"          : (False,   False,      True),   # memory fix, no credit fix
 }
 
 PPO_KWARGS = dict(
@@ -87,9 +89,23 @@ PPO_KWARGS = dict(
     n_epochs      = 10,
     gamma         = 0.99,
     gae_lambda    = 0.95,
-    ent_coef      = 0.01,
+    ent_coef      = 0.05,
     clip_range    = 0.2,
     vf_coef       = 0.5,
+    max_grad_norm = 0.5,
+    verbose       = 0,
+)
+
+RPPO_KWARGS = dict(
+    learning_rate = 1e-4,       # lower: RecurrentPPO more sensitive to lr
+    n_steps       = 512,        # shorter rollouts → fresher LSTM hidden states
+    batch_size    = 64,         # RecurrentPPO processes sequences; smaller is fine
+    n_epochs      = 4,          # CRITICAL: stale hidden states degrade after epoch 1
+    gamma         = 0.99,
+    gae_lambda    = 0.95,
+    ent_coef      = 0.05,       # keep entropy up — must explore both arms
+    clip_range    = 0.1,        # tighter: target clip_fraction < 0.15
+    vf_coef       = 1.0,
     max_grad_norm = 0.5,
     verbose       = 0,
 )
@@ -104,79 +120,129 @@ class OracleMetricsCallback(BaseCallback):
     Logs oracle-specific metrics to TensorBoard and stdout every `log_every` steps.
 
     TB tags written:
-      oracle/junction_correct_frac  — fraction of junction events that were correct
-      oracle/ep_bonus_mean          — mean oracle bonus per completed episode
-      oracle/ep_env_reward_mean     — mean raw env reward (oracle bonus subtracted out)
+      oracle/junction_correct_frac   — P(correct | junction reached)
+      oracle/junction_reached_frac   — P(junction reached) per episode
+      oracle/ep_env_reward_mean      — raw env reward (unshaded)
+      oracle/ep_bonus_mean           — total oracle bonus per episode (alpha * F)
+      oracle/ep_shaped_reward_mean   — env + bonus (what the policy actually sees)
 
-    rollout/ep_rew_mean (logged by SB3 automatically) shows the oracle-SHAPED reward,
-    which is intentionally inflated.  Use oracle/ep_env_reward_mean for true performance
-    during training.
+    rollout/ep_rew_mean (logged by SB3) is oracle-inflated; use
+    oracle/ep_env_reward_mean for true policy quality during training.
     """
 
     def __init__(self, log_every: int = 10_000, use_oracle: bool = True, verbose: int = 0):
         super().__init__(verbose)
-        self.log_every   = log_every
-        self.use_oracle  = use_oracle
-        self._last_log   = 0
+        self.log_every  = log_every
+        self.use_oracle = use_oracle
+        self._last_log  = 0
+        self._reset_accumulators()
 
-        # Accumulators reset each logging window
-        self._junction_correct : List[bool]  = []
-        self._ep_bonuses       : List[float] = []
-        self._ep_env_rewards   : List[float] = []
+    def _reset_accumulators(self):
+        self._junction_correct  : List[bool]  = []
+        self._junction_reached  : List[bool]  = []
+        self._ep_bonuses        : List[float] = []   # cumulative oracle bonus per ep
+        self._ep_env_rewards    : List[float] = []
+        self._ep_shaped_rewards : List[float] = []
+        self._cur_bonus         : float       = 0.0  # running total within current episode
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
 
         for info in infos:
-            # Junction accuracy (only fires when junction event occurred this step)
+            # Accumulate oracle bonus within the episode (wrapper sets this each bonus step)
+            self._cur_bonus += info.get("oracle_bonus", 0.0)
+
+            # Junction fired this step
             if "oracle_junction_correct" in info:
                 self._junction_correct.append(info["oracle_junction_correct"])
+                self._junction_reached.append(True)
 
-            # Per-episode oracle bonus and raw env reward (logged when episode ends)
+            # Episode ended
             if "episode" in info:
-                shaped_r = info["episode"]["r"]
-                bonus    = info.get("oracle_bonus", 0.0)  # bonus on this terminal step
-                # Approximate: accumulate total bonus from terminal-step info only.
-                # For a full per-episode breakdown we'd need wrapper-level tracking,
-                # but this gives a good signal.
-                self._ep_bonuses.append(bonus)
-                self._ep_env_rewards.append(shaped_r - bonus)
+                ep_shaped = info["episode"]["r"]
+                ep_env    = ep_shaped - self._cur_bonus
+
+                self._ep_bonuses.append(self._cur_bonus)
+                self._ep_env_rewards.append(ep_env)
+                self._ep_shaped_rewards.append(ep_shaped)
+
+                # If junction wasn't reached this episode, record False
+                if not (self._junction_reached and self._junction_reached[-1]):
+                    self._junction_reached.append(False)
+
+                self._cur_bonus = 0.0  # reset for next episode
 
         if self.num_timesteps - self._last_log >= self.log_every:
             # ── Junction accuracy ─────────────────────────────────────────────
             if self._junction_correct:
-                frac = float(np.mean(self._junction_correct))
-                self.logger.record("oracle/junction_correct_frac", frac)
+                self.logger.record(
+                    "oracle/junction_correct_frac",
+                    float(np.mean(self._junction_correct))
+                )
+
+            # ── Junction reached fraction ─────────────────────────────────────
+            if self._junction_reached:
+                self.logger.record(
+                    "oracle/junction_reached_frac",
+                    float(np.mean(self._junction_reached))
+                )
 
             # ── Episode reward breakdown ──────────────────────────────────────
             if self._ep_env_rewards:
-                self.logger.record("oracle/ep_env_reward_mean", float(np.mean(self._ep_env_rewards)))
-                self.logger.record("oracle/ep_bonus_mean",      float(np.mean(self._ep_bonuses)))
+                self.logger.record("oracle/ep_env_reward_mean",    float(np.mean(self._ep_env_rewards)))
+                self.logger.record("oracle/ep_bonus_mean",         float(np.mean(self._ep_bonuses)))
+                self.logger.record("oracle/ep_shaped_reward_mean", float(np.mean(self._ep_shaped_rewards)))
 
             # ── Stdout progress ───────────────────────────────────────────────
-            ep_rewards = [
-                info["episode"]["r"]
-                for info in infos
-                if "episode" in info
-            ]
-            if ep_rewards:
+            n_ep = len(self._ep_env_rewards)
+            if n_ep > 0:
                 jfrac = (
                     f"  junc_correct={np.mean(self._junction_correct):.2f}"
                     if self._junction_correct else ""
                 )
+                rfrac = (
+                    f"  junc_reached={np.mean(self._junction_reached):.2f}"
+                    if self._junction_reached else ""
+                )
                 print(
-                    f"  steps={self.num_timesteps:>8,}  "
-                    f"ep_rew(shaped)={np.mean(ep_rewards):.3f}"
-                    f"{jfrac}  n_eps={len(ep_rewards)}"
+                    f"  steps={self.num_timesteps:>8,}"
+                    f"  env_rew={np.mean(self._ep_env_rewards):.3f}"
+                    f"{jfrac}{rfrac}  n_eps={n_ep}"
                 )
 
-            # Reset accumulators
-            self._junction_correct = []
-            self._ep_bonuses       = []
-            self._ep_env_rewards   = []
+            self._reset_accumulators()
+            self._last_log = self.num_timesteps
             self._last_log = self.num_timesteps
 
         return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Model factory
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_model(use_lstm: bool, train_vec, seed: int, tb_log: str):
+    if use_lstm:
+        return RecurrentPPO(
+            "MlpLstmPolicy",
+            train_vec,
+            **RPPO_KWARGS,
+            seed            = seed,
+            tensorboard_log = tb_log,
+            policy_kwargs   = dict(
+                lstm_hidden_size = 256,
+                n_lstm_layers    = 1,
+                net_arch         = [64, 64],  # shared MLP before LSTM
+            ),
+        )
+    else:
+        return PPO(
+            "MlpPolicy",
+            train_vec,
+            **PPO_KWARGS,
+            seed            = seed,
+            tensorboard_log = tb_log,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,47 +264,35 @@ def run_single(
     Train one agent for one seed. Returns a results dict and writes a JSON file.
     Eval is always on the plain env (no oracle) to measure true policy quality.
     """
-    use_lstm, use_oracle = CONDITION_CFG[mode]
+    use_lstm, use_oracle, use_privileged = CONDITION_CFG[mode]
 
     print(f"\n{'─'*58}")
     print(f"  mode={mode}  seed={seed}  steps={total_steps:,}  "
-          f"oracle_alpha={alpha if use_oracle else 'N/A'}")
+          f"oracle_alpha={alpha if use_oracle else 'N/A'}"
+          f"{'  privileged=True' if use_privileged else ''}")
     print(f"{'─'*58}")
 
+    train_env_fn = make_env_fn(use_oracle, alpha, shaping_c, use_privileged, seed)
+    eval_env_fn  = make_eval_env_fn(use_privileged, seed + 10_000)
+
     train_vec = make_vec_env(
-        make_env_fn(use_oracle, alpha, shaping_c, seed),
+        train_env_fn,
         n_envs      = n_envs,
         seed        = seed,
         vec_env_cls = DummyVecEnv,
     )
     eval_vec = make_vec_env(
-        make_eval_env_fn(seed + 10_000),
+        eval_env_fn,
         n_envs      = 1,
         seed        = seed + 10_000,
         vec_env_cls = DummyVecEnv,
     )
 
-    tb_log     = str(results_dir / "tensorboard" / f"{mode}_seed{seed}")
+    tb_log     = str(results_dir / "tensorboard" / f"{mode}_seed{seed}_11")
     model_save = str(results_dir / "models"      / f"{mode}_seed{seed}")
     eval_log   = str(results_dir / "eval_logs"   / f"{mode}_seed{seed}")
 
-    if use_lstm:
-        model = RecurrentPPO(
-            "MlpLstmPolicy",
-            train_vec,
-            **PPO_KWARGS,
-            seed            = seed,
-            tensorboard_log = tb_log,
-            policy_kwargs   = dict(lstm_hidden_size=256, n_lstm_layers=1),
-        )
-    else:
-        model = PPO(
-            "MlpPolicy",
-            train_vec,
-            **PPO_KWARGS,
-            seed            = seed,
-            tensorboard_log = tb_log,
-        )
+    model = _build_model(use_lstm, train_vec, seed, tb_log)
 
     eval_callback = EvalCallback(
         eval_vec,
@@ -315,6 +369,7 @@ def main():
         help="Oracle shaping coefficient alpha.")
     parser.add_argument("--shaping_c", type=float, default=1.0,
         help="Raw shaping magnitude c (before alpha).")
+
     parser.add_argument("--n_envs",    type=int,   default=4,
         help="Parallel envs per training run.")
     parser.add_argument("--eval_freq", type=int,   default=10_000,
